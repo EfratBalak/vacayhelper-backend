@@ -17,16 +17,12 @@ app.get("/", (req, res) => {
 });
 
 // ── 1. CITY AUTOCOMPLETE ──
-// Gets city suggestions from Google as user types
 app.get("/api/autocomplete", async (req, res) => {
   const { input, country } = req.query;
   if (!input) return res.status(400).json({ error: "input required" });
-
   const components = country ? `&components=country:${country}` : "";
   const lang = req.query.language || "en";
-  // Use broader types to catch countries, regions and cities
   const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&types=(regions)${components}&key=${GOOGLE_API_KEY}&language=${lang}`;
-
   try {
     const response = await fetch(url);
     const data = await response.json();
@@ -36,52 +32,11 @@ app.get("/api/autocomplete", async (req, res) => {
   }
 });
 
-// ── 2. SEARCH HOTELS ──
-// Finds hotels in a city using Google Places
-app.get("/api/hotels", async (req, res) => {
-  const { city, country } = req.query;
-  if (!city) return res.status(400).json({ error: "city required" });
-
-  const query = `hotels in ${city}${country ? " " + country : ""}`;
-  const url = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&type=lodging&key=${GOOGLE_API_KEY}&language=en`;
-
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    // Filter: minimum 80 Google reviews
-    const filtered = (data.results || []).filter(h => h.user_ratings_total >= 80);
-    res.json({ results: filtered, status: data.status });
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── 3. HOTEL DETAILS ──
-// Gets full details, photos and reviews for a specific hotel
-app.get("/api/hotel-details", async (req, res) => {
-  const { placeId } = req.query;
-  if (!placeId) return res.status(400).json({ error: "placeId required" });
-
-  const fields = "name,rating,user_ratings_total,formatted_address,photos,website,price_level,reviews,types";
-  const url = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${placeId}&fields=${fields}&key=${GOOGLE_API_KEY}&language=en`;
-
-  try {
-    const response = await fetch(url);
-    const data = await response.json();
-    res.json(data);
-  } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ── 4. PHOTO URL ──
-// Returns direct Google photo URL for a hotel image
+// ── 2. PHOTO PROXY ──
 app.get("/api/photo", async (req, res) => {
   const { photoRef, maxWidth = 800 } = req.query;
   if (!photoRef) return res.status(400).json({ error: "photoRef required" });
-
   const url = `https://maps.googleapis.com/maps/api/place/photo?maxwidth=${maxWidth}&photoreference=${photoRef}&key=${GOOGLE_API_KEY}`;
-
   try {
     const response = await fetch(url);
     res.set("Content-Type", response.headers.get("content-type"));
@@ -91,64 +46,201 @@ app.get("/api/photo", async (req, res) => {
   }
 });
 
-// ── 5. AI MATCH ANALYSIS ──
-// Uses Claude to check if a hotel matches user preferences
-// Reads Google reviews and hotel description to decide
-app.post("/api/match", async (req, res) => {
-  const { hotel, userPreferences } = req.body;
-  if (!hotel || !userPreferences) {
-    return res.status(400).json({ error: "hotel and userPreferences required" });
-  }
+// ── 3. SEASONAL PRICE ESTIMATE ──
+// Based on price_level from Google + month + city popularity
+function estimatePrice(priceLevel, month, city) {
+  // Base price ranges per price_level
+  const base = { 1: 75, 2: 150, 3: 280, 4: 500 };
+  let price = base[priceLevel] || 150;
 
-  // Build prompt for Claude
-  const reviewsText = (hotel.reviews || [])
-    .slice(0, 5)
-    .map(r => `"${r.text}"`)
-    .join("\n");
+  // Seasonal multiplier
+  const highSeason = [6, 7, 8, 9]; // Jun-Sep
+  const midSeason = [3, 4, 5, 10, 12]; // Mar-May, Oct, Dec
+  if (highSeason.includes(month)) price *= 1.3;
+  else if (midSeason.includes(month)) price *= 1.1;
 
-  const prompt = `You are a hotel matching expert. Analyze if this hotel matches the user's preferences.
+  // Popular city premium
+  const premiumCities = ["paris", "rome", "london", "barcelona", "amsterdam", "tokyo", "new york", "venice"];
+  if (premiumCities.some(c => city.toLowerCase().includes(c))) price *= 1.2;
 
-HOTEL: ${hotel.name}
-LOCATION: ${hotel.formatted_address || ""}
-GOOGLE RATING: ${hotel.rating} (${hotel.user_ratings_total} reviews)
-HOTEL TYPES: ${(hotel.types || []).join(", ")}
-PRICE LEVEL: ${hotel.price_level ? "★".repeat(hotel.price_level) : "unknown"}
+  return Math.round(price);
+}
 
-RECENT GOOGLE REVIEWS:
-${reviewsText || "No reviews available"}
+// ── 4. MAIN SEARCH WITH FILTERING ──
+app.post("/api/search", async (req, res) => {
+  const { destination, filters, month } = req.body;
 
-USER PREFERENCES:
-- Guest type: ${userPreferences.guestType || "not specified"}
-- Meal plan: ${userPreferences.mealPlan || "not specified"}
-- Hotel types wanted: ${(userPreferences.hotelTypes || []).join(", ") || "any"}
-- Amenities wanted: ${(userPreferences.amenities || []).join(", ") || "none specified"}
-- Budget: max ${userPreferences.budget} ${userPreferences.currency} per night
-- Nights: ${userPreferences.nights}
-- Adults: ${userPreferences.adults}, Children: ${userPreferences.children}, Infants: ${userPreferences.infants}
-
-TASK:
-1. Decide if this hotel is a GOOD MATCH, PARTIAL MATCH, or NO MATCH for the user's preferences.
-2. For each preference the user selected, say if the hotel meets it or not.
-3. Give a relevance score from 0-100.
-4. Estimate the price per night for the requested room type and meal plan.
-
-Respond ONLY with valid JSON in this exact format:
-{
-  "matchLevel": "great" | "good" | "no",
-  "relevanceScore": 85,
-  "estimatedPricePerNight": 220,
-  "priceLabel": "Family room · All inclusive",
-  "matchReasons": [
-    "Has large family rooms based on reviews",
-    "Pool mentioned frequently in reviews"
-  ],
-  "missingFeatures": [
-    "No waterpark mentioned"
-  ],
-  "summary": "One sentence explaining why this hotel matches or doesn't match"
-}`;
+  if (!destination) return res.status(400).json({ error: "destination required" });
 
   try {
+    // STEP 1: Get hotels from Google Places
+    const query = `hotels in ${destination}`;
+    const searchUrl = `https://maps.googleapis.com/maps/api/place/textsearch/json?query=${encodeURIComponent(query)}&type=lodging&key=${GOOGLE_API_KEY}&language=en`;
+    const searchRes = await fetch(searchUrl);
+    const searchData = await searchRes.json();
+
+    if (!searchData.results || !searchData.results.length) {
+      return res.json({ results: [], message: "No hotels found" });
+    }
+
+    // STEP 2: Hard filters — rating, reviews, budget
+    const travelMonth = month || new Date().getMonth() + 1;
+    const maxBudget = filters.budget || 9999;
+    const minRating = filters.minRating || 0;
+    const minReviews = 80;
+
+    let candidates = searchData.results.filter(h => {
+      if ((h.user_ratings_total || 0) < minReviews) return false;
+      if ((h.rating || 0) < minRating) return false;
+      const priceLevel = h.price_level || 2;
+      const estimated = estimatePrice(priceLevel, travelMonth, destination);
+      h._estimatedPrice = estimated;
+      if (estimated > maxBudget * 1.1) return false; // 10% tolerance
+      return true;
+    });
+
+    // Sort by rating, take top 15 candidates for AI analysis
+    candidates = candidates
+      .sort((a, b) => (b.rating || 0) - (a.rating || 0))
+      .slice(0, 15);
+
+    if (!candidates.length) {
+      return res.json({ results: [], message: "No hotels match your basic criteria" });
+    }
+
+    // STEP 3: Get full details for each candidate
+    const detailedHotels = await Promise.all(
+      candidates.map(async (h) => {
+        try {
+          const fields = "name,rating,user_ratings_total,formatted_address,photos,website,price_level,reviews,types,editorial_summary";
+          const detailUrl = `https://maps.googleapis.com/maps/api/place/details/json?place_id=${h.place_id}&fields=${fields}&key=${GOOGLE_API_KEY}&language=en`;
+          const detailRes = await fetch(detailUrl);
+          const detailData = await detailRes.json();
+          return {
+            ...h,
+            ...detailData.result,
+            _estimatedPrice: h._estimatedPrice
+          };
+        } catch {
+          return h;
+        }
+      })
+    );
+
+    // STEP 4: If user has style filters — AI matching
+    const styleFilters = [
+      ...(filters.hotelTypes || []),
+      ...(filters.amenities || []),
+      ...(filters.mealPlan ? [filters.mealPlan] : []),
+      ...(filters.guestType ? [filters.guestType] : [])
+    ].filter(Boolean);
+
+    let matchedHotels = [];
+
+    if (styleFilters.length === 0) {
+      // No style filters — return all that passed hard filters
+      matchedHotels = detailedHotels.slice(0, 10).map(h => ({
+        ...h,
+        matchScore: 100,
+        matchReasons: ["Matches your search criteria"],
+        missingFeatures: []
+      }));
+    } else {
+      // AI matching for each hotel in parallel
+      const matchResults = await Promise.all(
+        detailedHotels.map(h => analyzeHotelMatch(h, filters, styleFilters))
+      );
+
+      // Only include hotels that passed ALL filters
+      matchedHotels = matchResults
+        .filter(r => r !== null)
+        .sort((a, b) => b.matchScore - a.matchScore)
+        .slice(0, 10);
+    }
+
+    res.json({ results: matchedHotels, total: matchedHotels.length });
+
+  } catch (err) {
+    console.error("Search error:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── AI MATCH ANALYSIS ──
+async function analyzeHotelMatch(hotel, filters, styleFilters) {
+  try {
+    // Build context: reviews + website content
+    const reviewsText = (hotel.reviews || [])
+      .slice(0, 8)
+      .map(r => r.text)
+      .join("\n---\n");
+
+    // Fetch hotel website if available
+    let websiteContent = "";
+    if (hotel.website) {
+      try {
+        const siteRes = await fetch(hotel.website, {
+          signal: AbortSignal.timeout(5000),
+          headers: { "User-Agent": "Mozilla/5.0" }
+        });
+        const html = await siteRes.text();
+        // Extract text from HTML (basic)
+        websiteContent = html
+          .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
+          .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .slice(0, 3000);
+      } catch {
+        websiteContent = "Website not accessible";
+      }
+    }
+
+    const prompt = `You are a strict hotel matching expert for a travel recommendation system.
+
+HOTEL: ${hotel.name}
+ADDRESS: ${hotel.formatted_address || ""}
+GOOGLE RATING: ${hotel.rating} (${hotel.user_ratings_total} reviews)
+PRICE LEVEL: ${"$".repeat(hotel.price_level || 2)}
+HOTEL TYPES FROM GOOGLE: ${(hotel.types || []).join(", ")}
+EDITORIAL SUMMARY: ${hotel.editorial_summary?.overview || "none"}
+
+GOOGLE REVIEWS (recent):
+${reviewsText || "No reviews available"}
+
+HOTEL WEBSITE CONTENT:
+${websiteContent || "Not available"}
+
+USER FILTERS TO CHECK:
+${styleFilters.map((f, i) => `${i + 1}. ${f}`).join("\n")}
+
+TASK:
+For EACH filter listed above, determine if there is CLEAR EVIDENCE in the reviews or website content.
+
+STRICT RULES:
+- If a filter has NO clear evidence → the hotel FAILS
+- Only pass a hotel if ALL filters have clear evidence
+- "Boutique hotel" evidence: words like boutique, intimate, unique, small, charming, character, individually designed
+- "Pool" evidence: pool, swimming, swim mentioned explicitly
+- "All inclusive" evidence: all-inclusive, all inclusive, meals included mentioned explicitly
+- "Kids club" evidence: kids club, children's club, childcare mentioned explicitly
+- "Spa hotel" evidence: spa, wellness, massage, treatment mentioned explicitly
+- "Pet friendly" evidence: pets, dogs, animals welcome mentioned explicitly
+- "Adults only" evidence: adults only, no children, 18+ mentioned explicitly
+- "Family hotel" evidence: family, families, kids, children welcome mentioned explicitly
+- "Boutique hotel", "Large hotel", "City centre hotel", "Rural / countryside", "Near main road" — check location and type clues
+
+Respond ONLY with valid JSON:
+{
+  "passed": true or false,
+  "matchScore": 0-100,
+  "filterResults": {
+    "Filter name": { "passed": true/false, "evidence": "quote or description" }
+  },
+  "matchReasons": ["reason1", "reason2"],
+  "missingFeatures": ["missing1"]
+}`;
+
     const response = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
@@ -157,25 +249,35 @@ Respond ONLY with valid JSON in this exact format:
         "anthropic-version": "2023-06-01"
       },
       body: JSON.stringify({
-        model: "claude-sonnet-4-20250514",
-        max_tokens: 1000,
+        model: "claude-haiku-4-5-20251001",
+        max_tokens: 800,
         messages: [{ role: "user", content: prompt }]
       })
     });
 
     const data = await response.json();
-    const text = data.content[0].text;
+    if (!data.content || !data.content[0]) return null;
 
-    // Parse JSON from Claude's response
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("No JSON in response");
+    const jsonMatch = data.content[0].text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+
     const result = JSON.parse(jsonMatch[0]);
 
-    res.json(result);
+    if (!result.passed) return null;
+
+    return {
+      ...hotel,
+      matchScore: result.matchScore || 80,
+      matchReasons: result.matchReasons || [],
+      missingFeatures: result.missingFeatures || [],
+      filterResults: result.filterResults || {}
+    };
+
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    console.error("Match error for", hotel.name, err.message);
+    return null;
   }
-});
+}
 
 app.listen(PORT, () => {
   console.log(`VacayHelper backend running on port ${PORT}`);
