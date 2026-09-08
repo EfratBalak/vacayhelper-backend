@@ -23,7 +23,9 @@ app.get("/api/autocomplete", async (req, res) => {
   if (!input) return res.status(400).json({ error: "input required" });
 
   const components = country ? `&components=country:${country}` : "";
-  const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&types=(cities)${components}&key=${GOOGLE_API_KEY}&language=en`;
+  const lang = req.query.language || "en";
+  // Use broader types to catch countries, regions and cities
+  const url = `https://maps.googleapis.com/maps/api/place/autocomplete/json?input=${encodeURIComponent(input)}&types=(regions)${components}&key=${GOOGLE_API_KEY}&language=${lang}`;
 
   try {
     const response = await fetch(url);
